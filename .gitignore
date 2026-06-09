@@ -1,0 +1,21 @@
+# Local/raw working files
+all_dominance_codes/
+Make_necessary_changes.ipynb
+Dir_structure.md
+Dir_structure - old.md
+enrich_split_csvs.py
+splits_old/
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+.venv/
+
+# Outputs/checkpoints
+outputs/
+runs/
+*.pth
+*.pt
+*.ckpt
