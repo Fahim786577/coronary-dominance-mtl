@@ -4,16 +4,25 @@ from __future__ import annotations
 
 from torch import Tensor, nn
 
-from src.models.backbones import build_resnet18_grayscale
+from src.models.backbones import build_backbone
 
 
 class SingleFrameTeacher(nn.Module):
-    """ResNet18 single-frame teacher for frame quality or dominance."""
+    """Single-frame teacher for frame quality or dominance."""
 
-    def __init__(self, num_classes: int = 2, pretrained: bool = True) -> None:
+    def __init__(
+        self,
+        num_classes: int = 2,
+        backbone_name: str = "resnet18",
+        pretrained: bool = True,
+    ) -> None:
         super().__init__()
-        self.backbone, feature_dim = build_resnet18_grayscale(pretrained=pretrained)
+        self.backbone, feature_dim = build_backbone(
+            backbone_name=backbone_name,
+            pretrained=pretrained,
+        )
         self.extractor = self.backbone
+        self.backbone_name = backbone_name
         self.spatial_pooling = nn.AdaptiveAvgPool2d((1, 1))
         self.classifier = nn.Linear(feature_dim, num_classes)
 
@@ -25,19 +34,24 @@ class SingleFrameTeacher(nn.Module):
 
 
 class VideoTeacher(nn.Module):
-    """ResNet18 plus LSTM teacher for occlusion clips."""
+    """Backbone plus LSTM teacher for occlusion clips."""
 
     def __init__(
         self,
         num_classes: int = 2,
+        backbone_name: str = "resnet18",
         pretrained: bool = True,
         lstm_hidden_size: int = 128,
         lstm_num_layers: int = 5,
         lstm_dropout: float = 0.2,
     ) -> None:
         super().__init__()
-        self.backbone, feature_dim = build_resnet18_grayscale(pretrained=pretrained)
+        self.backbone, feature_dim = build_backbone(
+            backbone_name=backbone_name,
+            pretrained=pretrained,
+        )
         self.extractor = self.backbone
+        self.backbone_name = backbone_name
         self.feature_dim = feature_dim
         self.spatial_pooling = nn.AdaptiveAvgPool2d((1, 1))
         self.temporal_model = nn.LSTM(

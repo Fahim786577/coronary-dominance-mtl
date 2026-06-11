@@ -1,29 +1,33 @@
-"""Temporal multi-task ResNet18 model for coronary tasks."""
+"""Temporal multi-task model for coronary tasks."""
 
 from __future__ import annotations
 
 from typing import Mapping
 
-import torch
 from torch import Tensor, nn
 
-from src.models.backbones import build_resnet18_grayscale
+from src.models.backbones import build_backbone
 
 
 class CoronaryTemporalMTL(nn.Module):
-    """Shared ResNet18 extractor with temporal and single-frame task heads."""
+    """Shared grayscale backbone with temporal and single-frame task heads."""
 
     def __init__(
         self,
         num_classes: int = 2,
+        backbone_name: str = "resnet18",
         pretrained: bool = True,
         lstm_hidden_size: int = 128,
         lstm_num_layers: int = 5,
         lstm_dropout: float = 0.2,
     ) -> None:
         super().__init__()
-        self.backbone, feature_dim = build_resnet18_grayscale(pretrained=pretrained)
+        self.backbone, feature_dim = build_backbone(
+            backbone_name=backbone_name,
+            pretrained=pretrained,
+        )
         self.extractor = self.backbone
+        self.backbone_name = backbone_name
         self.feature_dim = feature_dim
 
         self.spatial_pooling = nn.AdaptiveAvgPool2d((1, 1))
