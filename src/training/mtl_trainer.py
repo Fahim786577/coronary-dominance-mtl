@@ -198,6 +198,16 @@ class MTLTrainer:
             for row in history:
                 writer.writerow({key: "" if value is None else value for key, value in row.items()})
 
+    @staticmethod
+    def _print_task_metrics(prefix: str, metrics: dict[str, Any]) -> None:
+        """Print task-wise loss and accuracy for tasks present in the epoch."""
+        for task in TASKS:
+            loss = metrics["task_losses"][task]
+            accuracy = metrics["task_accuracies"][task]
+            if loss is None or accuracy is None:
+                continue
+            print(f"  {prefix:<5} {task:<14} loss={loss:.4f} acc={accuracy:.4f}")
+
     def fit(self, config_dict: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Run baseline MTL training and checkpoint best/last models."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -238,6 +248,8 @@ class MTLTrainer:
                 f"val_mean_acc={val_metrics['mean_accuracy']:.4f} "
                 f"lr={self.optimizer.param_groups[0]['lr']:.6g}"
             )
+            self._print_task_metrics("train", train_metrics)
+            self._print_task_metrics("val", val_metrics)
 
             if epochs_without_improvement >= self.config.early_stopping_patience:
                 print(f"Early stopping after {epoch} epochs.")
