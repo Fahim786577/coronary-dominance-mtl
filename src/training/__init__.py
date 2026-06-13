@@ -9,6 +9,7 @@ from src.training.distillation import (
     temperature_scaled_kl_loss,
 )
 from src.training.metrics import AverageMeter, accuracy_from_logits
+from src.training.mtl_trainer import MTLTrainer, MTLTrainerConfig
 from src.training.teacher_loading import (
     folder_task_name,
     freeze_teacher,
@@ -24,6 +25,8 @@ __all__ = [
     "AverageMeter",
     "DEFAULT_ALPHAS",
     "DEFAULT_TEMPERATURE",
+    "MTLTrainer",
+    "MTLTrainerConfig",
     "TeacherTrainer",
     "accuracy_from_logits",
     "distillation_ce_kl_loss",
