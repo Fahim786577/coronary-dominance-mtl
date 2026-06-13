@@ -1,4 +1,4 @@
-"""Train baseline supervised CoronaryTemporalMTL student models."""
+"""Train baseline or MTD CoronaryTemporalMTL student models."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.data.mtl_dataset import CoronaryMTLDataset
 from src.models import CoronaryTemporalMTL
 from src.training.mtl_trainer import MTLTrainer, MTLTrainerConfig
+from src.training.teacher_loading import load_teacher_bundle, resolve_teacher_checkpoint_path
 from src.utils.paths import normalize_artery
 
 
@@ -62,6 +63,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task_weight_dominance", type=float, default=1.0)
     parser.add_argument("--use_mtd", type=parse_bool, default=False)
     parser.add_argument("--use_twophase", type=parse_bool, default=False)
+    parser.add_argument("--teacher_root", type=Path, default=Path("outputs/teachers"))
+    parser.add_argument("--teacher_checkpoint_name", default="best.pt")
+    parser.add_argument("--mtd_temperature", type=float, default=4.0)
+    parser.add_argument("--mtd_alpha_occlusion", type=float, default=0.1)
+    parser.add_argument("--mtd_alpha_frame_quality", type=float, default=0.1)
+    parser.add_argument("--mtd_alpha_dominance", type=float, default=0.1)
     return parser.parse_args()
 
 
@@ -69,10 +76,8 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     args.artery = normalize_artery(args.artery)
     if args.artery not in {"RCA", "LCA"}:
         raise ValueError(f"artery must be RCA or LCA, got '{args.artery}'.")
-    if args.use_mtd:
-        raise NotImplementedError("MTD training is Step 5B and is not implemented in Step 5A.")
     if args.use_twophase:
-        raise NotImplementedError("TwoPhase training is Step 6 and is not implemented in Step 5A.")
+        raise NotImplementedError("TwoPhase training is Step 6 and is not implemented in Step 5B.")
     return args
 
 
@@ -94,7 +99,49 @@ def config_dict(args: argparse.Namespace) -> dict[str, Any]:
     config["data_root"] = str(args.data_root)
     config["split_root"] = str(args.split_root)
     config["output_dir"] = str(args.output_dir)
+    config["teacher_root"] = str(args.teacher_root)
     return config
+
+
+def mtd_alphas(args: argparse.Namespace) -> dict[str, float]:
+    return {
+        "occlusion": args.mtd_alpha_occlusion,
+        "frame_quality": args.mtd_alpha_frame_quality,
+        "dominance": args.mtd_alpha_dominance,
+    }
+
+
+def load_mtd_teachers(
+    args: argparse.Namespace,
+    tasks: tuple[str, ...],
+    device: torch.device,
+) -> dict[str, torch.nn.Module]:
+    """Load required MTD teachers, raising a task-specific path error if missing."""
+    for task in tasks:
+        checkpoint_path = resolve_teacher_checkpoint_path(
+            teacher_root=args.teacher_root,
+            task=task,
+            artery=args.artery,
+            fold=args.fold,
+            backbone=args.backbone,
+            checkpoint_name=args.teacher_checkpoint_name,
+        )
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                "Missing teacher checkpoint for "
+                f"task='{task}', artery='{args.artery}', fold={args.fold}, "
+                f"backbone='{args.backbone}'. Expected: {checkpoint_path}"
+            )
+
+    return load_teacher_bundle(
+        teacher_root=args.teacher_root,
+        tasks=tasks,
+        artery=args.artery,
+        fold=args.fold,
+        backbone=args.backbone,
+        device=device,
+        checkpoint_name=args.teacher_checkpoint_name,
+    )
 
 
 def main() -> int:
@@ -165,10 +212,12 @@ def main() -> int:
         "frame_quality": args.task_weight_frame_quality,
         "dominance": args.task_weight_dominance,
     }
+    alphas = mtd_alphas(args)
+    teachers = load_mtd_teachers(args, train_dataset.tasks, device) if args.use_mtd else None
 
     checkpoint_dir = (
         args.output_dir
-        / "baseline"
+        / ("mtd" if args.use_mtd else "baseline")
         / f"DATA_{args.artery}"
         / f"fold_{args.fold}"
         / args.backbone
@@ -187,16 +236,35 @@ def main() -> int:
             early_stopping_patience=args.early_stopping_patience,
             gradient_clip_max_norm=args.gradient_clip_max_norm,
             task_weights=task_weights,
+            use_mtd=args.use_mtd,
+            mtd_temperature=args.mtd_temperature,
+            mtd_alphas=alphas,
         ),
         checkpoint_metadata={
             "artery": args.artery,
             "fold": args.fold,
             "backbone": args.backbone,
+            "use_mtd": args.use_mtd,
+            **(
+                {
+                    "temperature": args.mtd_temperature,
+                    "mtd_alphas": alphas,
+                    "teacher_root": str(args.teacher_root),
+                    "teacher_checkpoint_name": args.teacher_checkpoint_name,
+                }
+                if args.use_mtd
+                else {}
+            ),
         },
+        teachers=teachers,
     )
 
-    print(f"Training baseline MTL on {device}")
+    mode_label = "MTL + MTD" if args.use_mtd else "baseline MTL"
+    print(f"Training {mode_label} on {device}")
     print(f"Artery: {args.artery} | Tasks: {', '.join(train_dataset.tasks)}")
+    if args.use_mtd:
+        print(f"Teacher root: {args.teacher_root}")
+        print(f"Teacher checkpoint: {args.teacher_checkpoint_name}")
     print(f"Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}")
     print(f"Checkpoint directory: {checkpoint_dir}")
     trainer.fit(config_dict(args))

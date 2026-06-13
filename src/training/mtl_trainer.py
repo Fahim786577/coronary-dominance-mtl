@@ -1,4 +1,4 @@
-"""Baseline supervised MTL trainer."""
+"""Baseline and MTD supervised MTL trainer."""
 
 from __future__ import annotations
 
@@ -13,7 +13,9 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 from src.training.checkpointing import save_checkpoint
+from src.training.distillation import DEFAULT_ALPHAS, DEFAULT_TEMPERATURE, distillation_ce_kl_loss
 from src.training.metrics import AverageMeter, accuracy_from_logits
+from src.training.teacher_loading import run_teacher_bundle
 
 
 TASKS = ("occlusion", "frame_quality", "dominance")
@@ -21,12 +23,15 @@ TASKS = ("occlusion", "frame_quality", "dominance")
 
 @dataclass
 class MTLTrainerConfig:
-    """Runtime controls for baseline MTL training."""
+    """Runtime controls for MTL training."""
 
     max_epochs: int
     early_stopping_patience: int
     gradient_clip_max_norm: float | None = 1.0
     task_weights: dict[str, float] | None = None
+    use_mtd: bool = False
+    mtd_temperature: float = DEFAULT_TEMPERATURE
+    mtd_alphas: dict[str, float] | None = None
 
 
 def move_batch_to_device(
@@ -56,6 +61,7 @@ class MTLTrainer:
         output_dir: str | Path,
         config: MTLTrainerConfig,
         checkpoint_metadata: Mapping[str, Any],
+        teachers: dict[str, nn.Module] | None = None,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -67,16 +73,20 @@ class MTLTrainer:
         self.output_dir = Path(output_dir)
         self.config = config
         self.task_weights = config.task_weights or {task: 1.0 for task in TASKS}
+        self.mtd_alphas = config.mtd_alphas or dict(DEFAULT_ALPHAS)
         self.checkpoint_metadata = dict(checkpoint_metadata)
+        self.teachers = teachers or {}
+        if self.config.use_mtd and not self.teachers:
+            raise ValueError("MTD training requires at least one loaded teacher.")
         self.history: list[dict[str, Any]] = []
         self.best_val_accuracy = -1.0
         self.best_val_loss = float("inf")
 
-    def _compute_losses(
+    def _compute_supervised_losses(
         self,
         outputs: dict[str, Tensor],
         targets: dict[str, Tensor],
-    ) -> tuple[Tensor, dict[str, Tensor], dict[str, float]]:
+    ) -> tuple[Tensor, dict[str, Tensor], dict[str, float], dict[str, dict[str, float]]]:
         task_losses: dict[str, Tensor] = {}
         task_accuracies: dict[str, float] = {}
         weighted_losses: list[Tensor] = []
@@ -91,20 +101,72 @@ class MTLTrainer:
 
         if not weighted_losses:
             raise ValueError("No task losses could be computed for this MTL batch.")
-        return torch.stack(weighted_losses).mean(), task_losses, task_accuracies
+        return torch.stack(weighted_losses).mean(), task_losses, task_accuracies, {}
+
+    def _compute_mtd_losses(
+        self,
+        outputs: dict[str, Tensor],
+        teacher_outputs: dict[str, Tensor],
+        targets: dict[str, Tensor],
+    ) -> tuple[Tensor, dict[str, Tensor], dict[str, float], dict[str, dict[str, float]]]:
+        task_losses: dict[str, Tensor] = {}
+        task_accuracies: dict[str, float] = {}
+        task_components: dict[str, dict[str, float]] = {}
+        weighted_losses: list[Tensor] = []
+
+        for task in TASKS:
+            if task not in outputs or task not in teacher_outputs or task not in targets:
+                continue
+            loss, components = distillation_ce_kl_loss(
+                student_logits=outputs[task],
+                teacher_logits=teacher_outputs[task],
+                targets=targets[task],
+                alpha=self.mtd_alphas.get(task, DEFAULT_ALPHAS[task]),
+                temperature=self.config.mtd_temperature,
+                ce_loss_fn=self.criterion,
+            )
+            task_losses[task] = loss
+            task_accuracies[task] = accuracy_from_logits(outputs[task].detach(), targets[task])
+            task_components[task] = components
+            weighted_losses.append(loss * self.task_weights.get(task, 1.0))
+
+        if not weighted_losses:
+            raise ValueError("No MTD task losses could be computed for this MTL batch.")
+        return torch.stack(weighted_losses).mean(), task_losses, task_accuracies, task_components
 
     def _run_epoch(self, loader: DataLoader, train: bool) -> dict[str, Any]:
         self.model.train(train)
         total_loss_meter = AverageMeter()
         task_loss_meters = {task: AverageMeter() for task in TASKS}
         task_accuracy_meters = {task: AverageMeter() for task in TASKS}
+        ce_loss_meters = {task: AverageMeter() for task in TASKS}
+        kl_loss_meters = {task: AverageMeter() for task in TASKS}
+        mtd_loss_meters = {task: AverageMeter() for task in TASKS}
 
         for inputs, targets in loader:
             inputs, targets = move_batch_to_device(inputs, targets, self.device)
 
             with torch.set_grad_enabled(train):
                 outputs = self.model(inputs)
-                total_loss, task_losses, task_accuracies = self._compute_losses(outputs, targets)
+                if train and self.config.use_mtd:
+                    teacher_outputs = run_teacher_bundle(self.teachers, inputs)
+                    missing_teachers = [
+                        task
+                        for task in TASKS
+                        if task in outputs and task in targets and task not in teacher_outputs
+                    ]
+                    if missing_teachers:
+                        missing = ", ".join(missing_teachers)
+                        raise RuntimeError(f"MTD training is missing teacher outputs for: {missing}.")
+                    total_loss, task_losses, task_accuracies, task_components = self._compute_mtd_losses(
+                        outputs,
+                        teacher_outputs,
+                        targets,
+                    )
+                else:
+                    total_loss, task_losses, task_accuracies, task_components = (
+                        self._compute_supervised_losses(outputs, targets)
+                    )
 
                 if train:
                     self.optimizer.zero_grad(set_to_none=True)
@@ -121,6 +183,10 @@ class MTLTrainer:
             for task, loss in task_losses.items():
                 task_loss_meters[task].update(loss.item(), batch_size)
                 task_accuracy_meters[task].update(task_accuracies[task], batch_size)
+            for task, components in task_components.items():
+                ce_loss_meters[task].update(components["ce_loss"], batch_size)
+                kl_loss_meters[task].update(components["kl_loss"], batch_size)
+                mtd_loss_meters[task].update(components["total_loss"], batch_size)
 
         available_accuracies = [
             meter.average for meter in task_accuracy_meters.values() if meter.count > 0
@@ -136,6 +202,14 @@ class MTLTrainer:
             "task_accuracies": {
                 task: meter.average if meter.count > 0 else None
                 for task, meter in task_accuracy_meters.items()
+            },
+            "mtd_components": {
+                task: {
+                    "ce_loss": ce_loss_meters[task].average if ce_loss_meters[task].count > 0 else None,
+                    "kl_loss": kl_loss_meters[task].average if kl_loss_meters[task].count > 0 else None,
+                    "mtd_loss": mtd_loss_meters[task].average if mtd_loss_meters[task].count > 0 else None,
+                }
+                for task in TASKS
             },
         }
 
@@ -153,6 +227,9 @@ class MTLTrainer:
             row[f"val_{task}_loss"] = val_metrics["task_losses"][task]
             row[f"train_{task}_accuracy"] = train_metrics["task_accuracies"][task]
             row[f"val_{task}_accuracy"] = val_metrics["task_accuracies"][task]
+            row[f"train_{task}_ce_loss"] = train_metrics["mtd_components"][task]["ce_loss"]
+            row[f"train_{task}_kl_loss"] = train_metrics["mtd_components"][task]["kl_loss"]
+            row[f"train_{task}_mtd_loss"] = train_metrics["mtd_components"][task]["mtd_loss"]
         return row
 
     def _checkpoint_payload(self, epoch: int, config_dict: Mapping[str, Any]) -> dict[str, Any]:
@@ -165,7 +242,8 @@ class MTLTrainer:
             "best_val_accuracy": self.best_val_accuracy,
             "best_val_loss": self.best_val_loss,
             **self.checkpoint_metadata,
-            "mode": "baseline_mtl",
+            "mode": "mtl_mtd" if self.config.use_mtd else "baseline_mtl",
+            "use_mtd": self.config.use_mtd,
             "config": dict(config_dict),
         }
 
@@ -191,6 +269,19 @@ class MTLTrainer:
             "val_dominance_accuracy",
             "learning_rate",
         ]
+        mtd_fieldnames = [
+            "train_occlusion_ce_loss",
+            "train_occlusion_kl_loss",
+            "train_occlusion_mtd_loss",
+            "train_frame_quality_ce_loss",
+            "train_frame_quality_kl_loss",
+            "train_frame_quality_mtd_loss",
+            "train_dominance_ce_loss",
+            "train_dominance_kl_loss",
+            "train_dominance_mtd_loss",
+        ]
+        if any(row.get(field) is not None for row in history for field in mtd_fieldnames):
+            fieldnames.extend(mtd_fieldnames)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", newline="", encoding="utf-8") as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction="ignore")
@@ -206,7 +297,15 @@ class MTLTrainer:
             accuracy = metrics["task_accuracies"][task]
             if loss is None or accuracy is None:
                 continue
-            print(f"  {prefix:<5} {task:<14} loss={loss:.4f} acc={accuracy:.4f}")
+            components = metrics["mtd_components"][task]
+            if components["ce_loss"] is not None and components["kl_loss"] is not None:
+                print(
+                    f"  {prefix:<5} {task:<14} loss={loss:.4f} "
+                    f"ce={components['ce_loss']:.4f} kl={components['kl_loss']:.4f} "
+                    f"acc={accuracy:.4f}"
+                )
+            else:
+                print(f"  {prefix:<5} {task:<14} loss={loss:.4f} acc={accuracy:.4f}")
 
     def fit(self, config_dict: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Run baseline MTL training and checkpoint best/last models."""
