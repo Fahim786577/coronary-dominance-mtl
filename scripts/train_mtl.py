@@ -19,6 +19,7 @@ from src.data.mtl_dataset import CoronaryMTLDataset
 from src.models import CoronaryTemporalMTL
 from src.training.mtl_trainer import MTLTrainer, MTLTrainerConfig
 from src.training.teacher_loading import load_teacher_bundle, resolve_teacher_checkpoint_path
+from src.training.transfer import apply_transfer_initialization
 from src.utils.paths import normalize_artery
 
 
@@ -73,6 +74,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--twophase_priority_source", default="shared_grad_norm")
     parser.add_argument("--twophase_projection", type=parse_bool, default=True)
     parser.add_argument("--twophase_eps", type=float, default=1e-12)
+    parser.add_argument("--transfer_from_checkpoint", type=Path, default=None)
+    parser.add_argument("--transfer_from_artery", default="RCA")
+    parser.add_argument(
+        "--transfer_load_scope",
+        default="shared_and_common_heads",
+        choices=["all", "shared", "shared_and_common_heads"],
+    )
+    parser.add_argument("--allow_transfer_backbone_mismatch", type=parse_bool, default=False)
+    parser.add_argument("--allow_transfer_fold_mismatch", type=parse_bool, default=False)
     return parser.parse_args()
 
 
@@ -86,6 +96,9 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
         raise NotImplementedError(
             "Only --twophase_priority_source shared_grad_norm is implemented in Step 6."
         )
+    args.transfer_from_artery = normalize_artery(args.transfer_from_artery)
+    if args.transfer_from_checkpoint is not None and args.artery != "LCA":
+        raise ValueError("RCA -> LCA transfer requires --artery LCA.")
     return args
 
 
@@ -108,6 +121,8 @@ def config_dict(args: argparse.Namespace) -> dict[str, Any]:
     config["split_root"] = str(args.split_root)
     config["output_dir"] = str(args.output_dir)
     config["teacher_root"] = str(args.teacher_root)
+    if args.transfer_from_checkpoint is not None:
+        config["transfer_from_checkpoint"] = str(args.transfer_from_checkpoint)
     return config
 
 
@@ -154,12 +169,16 @@ def load_mtd_teachers(
 
 def output_mode_name(args: argparse.Namespace) -> str:
     if args.use_mtd and args.use_twophase:
-        return "mtd_twophase"
-    if args.use_mtd:
-        return "mtd"
-    if args.use_twophase:
-        return "twophase"
-    return "baseline"
+        mode = "mtd_twophase"
+    elif args.use_mtd:
+        mode = "mtd"
+    elif args.use_twophase:
+        mode = "twophase"
+    else:
+        mode = "baseline"
+    if args.transfer_from_checkpoint is not None:
+        return f"{mode}_transfer"
+    return mode
 
 
 def trainer_mode_name(args: argparse.Namespace) -> str:
@@ -170,6 +189,22 @@ def trainer_mode_name(args: argparse.Namespace) -> str:
     if args.use_twophase:
         return "mtl_twophase_practical"
     return "baseline_mtl"
+
+
+def transfer_metadata(args: argparse.Namespace, transfer_info: dict[str, Any] | None) -> dict[str, Any]:
+    if transfer_info is None:
+        return {"transfer_learning": False}
+    return {
+        "transfer_learning": True,
+        "transfer_source_checkpoint": str(args.transfer_from_checkpoint),
+        "transfer_source_artery": args.transfer_from_artery,
+        "transfer_target_artery": args.artery,
+        "transfer_load_scope": args.transfer_load_scope,
+        "transfer_loaded_keys": transfer_info["loaded_keys"],
+        "transfer_skipped_keys": transfer_info["skipped_keys"],
+        "transfer_loaded_key_count": transfer_info["loaded_key_count"],
+        "transfer_skipped_key_count": transfer_info["skipped_key_count"],
+    }
 
 
 def main() -> int:
@@ -223,6 +258,21 @@ def main() -> int:
         backbone_name=args.backbone,
         pretrained=args.pretrained,
     ).to(device)
+    transfer_info = None
+    if args.transfer_from_checkpoint is not None:
+        transfer_info = apply_transfer_initialization(
+            model=model,
+            checkpoint_path=args.transfer_from_checkpoint,
+            source_artery=args.transfer_from_artery,
+            target_artery=args.artery,
+            fold=args.fold,
+            backbone=args.backbone,
+            load_scope=args.transfer_load_scope,
+            allow_backbone_mismatch=args.allow_transfer_backbone_mismatch,
+            allow_fold_mismatch=args.allow_transfer_fold_mismatch,
+            map_location=device,
+        )
+
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -281,6 +331,7 @@ def main() -> int:
             "mode": trainer_mode_name(args),
             "use_mtd": args.use_mtd,
             "use_twophase": args.use_twophase,
+            **transfer_metadata(args, transfer_info),
             **(
                 {
                     "twophase_mode": args.twophase_mode,
@@ -314,6 +365,14 @@ def main() -> int:
     elif args.use_twophase:
         mode_label = "baseline MTL + TwoPhase practical"
     print(f"Training {mode_label} on {device}")
+    if transfer_info is not None:
+        print("Transfer learning enabled")
+        print(f"Source checkpoint: {args.transfer_from_checkpoint}")
+        print(f"Source artery: {args.transfer_from_artery}")
+        print(f"Target artery: {args.artery}")
+        print(f"Transfer load scope: {args.transfer_load_scope}")
+        print(f"Loaded keys: {transfer_info['loaded_key_count']}")
+        print(f"Skipped keys: {transfer_info['skipped_key_count']}")
     print(f"Artery: {args.artery} | Tasks: {', '.join(train_dataset.tasks)}")
     if args.use_mtd:
         print(f"Teacher root: {args.teacher_root}")

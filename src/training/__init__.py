@@ -28,6 +28,11 @@ from src.training.twophase import (
     run_twophase_phase2_step,
     select_priority_task,
 )
+from src.training.transfer import (
+    apply_transfer_initialization,
+    filter_transfer_state_dict,
+    load_transfer_checkpoint,
+)
 
 __all__ = [
     "AverageMeter",
@@ -37,10 +42,13 @@ __all__ = [
     "MTLTrainerConfig",
     "TeacherTrainer",
     "accuracy_from_logits",
+    "apply_transfer_initialization",
     "distillation_ce_kl_loss",
+    "filter_transfer_state_dict",
     "folder_task_name",
     "freeze_teacher",
     "load_checkpoint",
+    "load_transfer_checkpoint",
     "load_teacher_bundle",
     "load_teacher_from_checkpoint",
     "model_task_name",
