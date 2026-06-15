@@ -20,6 +20,14 @@ from src.training.teacher_loading import (
     run_teacher_bundle,
 )
 from src.training.teacher_trainer import TeacherTrainer
+from src.training.twophase import (
+    compute_task_gradients,
+    get_shared_parameter_items,
+    project_against_priority,
+    run_twophase_phase1_step,
+    run_twophase_phase2_step,
+    select_priority_task,
+)
 
 __all__ = [
     "AverageMeter",
@@ -37,9 +45,15 @@ __all__ = [
     "load_teacher_from_checkpoint",
     "model_task_name",
     "multi_task_distillation_losses",
+    "compute_task_gradients",
+    "get_shared_parameter_items",
+    "project_against_priority",
     "resolve_teacher_checkpoint_path",
+    "run_twophase_phase1_step",
+    "run_twophase_phase2_step",
     "run_teacher_bundle",
     "save_checkpoint",
     "save_history_csv",
+    "select_priority_task",
     "temperature_scaled_kl_loss",
 ]

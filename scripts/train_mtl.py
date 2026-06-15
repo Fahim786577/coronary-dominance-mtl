@@ -69,6 +69,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mtd_alpha_occlusion", type=float, default=0.1)
     parser.add_argument("--mtd_alpha_frame_quality", type=float, default=0.1)
     parser.add_argument("--mtd_alpha_dominance", type=float, default=0.1)
+    parser.add_argument("--twophase_mode", default="practical")
+    parser.add_argument("--twophase_priority_source", default="shared_grad_norm")
+    parser.add_argument("--twophase_projection", type=parse_bool, default=True)
+    parser.add_argument("--twophase_eps", type=float, default=1e-12)
     return parser.parse_args()
 
 
@@ -76,8 +80,12 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     args.artery = normalize_artery(args.artery)
     if args.artery not in {"RCA", "LCA"}:
         raise ValueError(f"artery must be RCA or LCA, got '{args.artery}'.")
-    if args.use_twophase:
-        raise NotImplementedError("TwoPhase training is Step 6 and is not implemented in Step 5B.")
+    if args.use_twophase and args.twophase_mode != "practical":
+        raise NotImplementedError("Only --twophase_mode practical is implemented in Step 6.")
+    if args.use_twophase and args.twophase_priority_source != "shared_grad_norm":
+        raise NotImplementedError(
+            "Only --twophase_priority_source shared_grad_norm is implemented in Step 6."
+        )
     return args
 
 
@@ -142,6 +150,26 @@ def load_mtd_teachers(
         device=device,
         checkpoint_name=args.teacher_checkpoint_name,
     )
+
+
+def output_mode_name(args: argparse.Namespace) -> str:
+    if args.use_mtd and args.use_twophase:
+        return "mtd_twophase"
+    if args.use_mtd:
+        return "mtd"
+    if args.use_twophase:
+        return "twophase"
+    return "baseline"
+
+
+def trainer_mode_name(args: argparse.Namespace) -> str:
+    if args.use_mtd and args.use_twophase:
+        return "mtl_mtd_twophase_practical"
+    if args.use_mtd:
+        return "mtl_mtd"
+    if args.use_twophase:
+        return "mtl_twophase_practical"
+    return "baseline_mtl"
 
 
 def main() -> int:
@@ -217,7 +245,7 @@ def main() -> int:
 
     checkpoint_dir = (
         args.output_dir
-        / ("mtd" if args.use_mtd else "baseline")
+        / output_mode_name(args)
         / f"DATA_{args.artery}"
         / f"fold_{args.fold}"
         / args.backbone
@@ -239,12 +267,31 @@ def main() -> int:
             use_mtd=args.use_mtd,
             mtd_temperature=args.mtd_temperature,
             mtd_alphas=alphas,
+            use_twophase=args.use_twophase,
+            twophase_mode=args.twophase_mode,
+            twophase_priority_source=args.twophase_priority_source,
+            twophase_projection=args.twophase_projection,
+            twophase_eps=args.twophase_eps,
+            twophase_seed=args.seed,
         ),
         checkpoint_metadata={
             "artery": args.artery,
             "fold": args.fold,
             "backbone": args.backbone,
+            "mode": trainer_mode_name(args),
             "use_mtd": args.use_mtd,
+            "use_twophase": args.use_twophase,
+            **(
+                {
+                    "twophase_mode": args.twophase_mode,
+                    "twophase_is_paper_faithful": False,
+                    "twophase_priority_source": args.twophase_priority_source,
+                    "twophase_projection": args.twophase_projection,
+                    "twophase_eps": args.twophase_eps,
+                }
+                if args.use_twophase
+                else {}
+            ),
             **(
                 {
                     "temperature": args.mtd_temperature,
@@ -259,7 +306,13 @@ def main() -> int:
         teachers=teachers,
     )
 
-    mode_label = "MTL + MTD" if args.use_mtd else "baseline MTL"
+    mode_label = "baseline MTL"
+    if args.use_mtd and args.use_twophase:
+        mode_label = "MTL + MTD + TwoPhase practical"
+    elif args.use_mtd:
+        mode_label = "MTL + MTD"
+    elif args.use_twophase:
+        mode_label = "baseline MTL + TwoPhase practical"
     print(f"Training {mode_label} on {device}")
     print(f"Artery: {args.artery} | Tasks: {', '.join(train_dataset.tasks)}")
     if args.use_mtd:
