@@ -20,6 +20,7 @@ from src.training.checkpointing import load_checkpoint
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 FRAME_NUMBER_PATTERN = re.compile(r"_frame_(\d+)(?=\.[^.]+$|$)", re.IGNORECASE)
+NATURAL_SORT_PATTERN = re.compile(r"(\d+)")
 
 FRAME_PREDICTION_COLUMNS = (
     "artery",
@@ -31,6 +32,38 @@ FRAME_PREDICTION_COLUMNS = (
     "dominance_pred",
     "dominance_prob_rightdom",
     "dominance_prob_leftdom",
+)
+PAIR_PREDICTION_COLUMNS = (
+    "pair_index",
+    "rca_sequence_dir",
+    "lca_sequence_dir",
+    "status",
+    "reason",
+    "route_used",
+    "rca_occluded",
+    "occlusion_probability",
+    "num_rca_frames",
+    "num_lca_frames",
+    "num_selected_frames",
+    "num_informative_frames",
+    "fallback_all_frames",
+    "vote_rightdom",
+    "vote_leftdom",
+    "mean_prob_rightdom",
+    "mean_prob_leftdom",
+    "pred_class",
+    "pred_label",
+    "final_confidence",
+)
+PAIR_FRAME_PREDICTION_COLUMNS = ("pair_index", *FRAME_PREDICTION_COLUMNS)
+SEQUENCE_PAIRING_REPORT_COLUMNS = (
+    "sequence_type",
+    "sequence_index",
+    "sequence_dir",
+    "paired",
+    "pair_index",
+    "status",
+    "reason",
 )
 
 DOMINANCE_LABELS = {0: "rightdom", 1: "leftdom"}
@@ -78,6 +111,16 @@ class IntegratedInferenceResult:
     frame_rows: list[dict[str, Any]]
 
 
+@dataclass
+class MultiSequenceInferenceResult:
+    """Final multi-sequence study result and output table rows."""
+
+    study_final_prediction: dict[str, Any]
+    pair_rows: list[dict[str, Any]]
+    pair_frame_rows: list[dict[str, Any]]
+    pairing_report_rows: list[dict[str, Any]]
+
+
 def resolve_device(device_arg: str) -> torch.device:
     """Resolve auto/cpu/cuda device strings."""
     if device_arg == "auto":
@@ -113,6 +156,20 @@ def _frame_sort_key(path: Path) -> tuple[int, int | str]:
     return 1, path.name
 
 
+def natural_sort_key(path: Path) -> list[int | str]:
+    """Return a deterministic natural/alphanumeric sort key for paths."""
+    parts = NATURAL_SORT_PATTERN.split(path.name.lower())
+    return [int(part) if part.isdigit() else part for part in parts]
+
+
+def discover_sequence_dirs(study_dir: str | Path) -> list[Path]:
+    """Discover immediate sequence subdirectories in natural sort order."""
+    directory = Path(study_dir)
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Study sequence directory not found: {directory}")
+    return sorted([path for path in directory.iterdir() if path.is_dir()], key=natural_sort_key)
+
+
 def list_frame_paths(frame_dir: str | Path) -> list[Path]:
     """List image frames from a directory in deterministic frame order."""
     directory = Path(frame_dir)
@@ -127,6 +184,17 @@ def list_frame_paths(frame_dir: str | Path) -> list[Path]:
     if not paths:
         raise ValueError(f"No image frames found in {directory}.")
     return sorted(paths, key=_frame_sort_key)
+
+
+def has_valid_image_files(frame_dir: str | Path) -> bool:
+    """Return whether a sequence directory contains at least one valid image file."""
+    directory = Path(frame_dir)
+    if not directory.is_dir():
+        return False
+    return any(
+        path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        for path in directory.iterdir()
+    )
 
 
 def load_frame_records(
@@ -378,3 +446,286 @@ def write_integrated_outputs(
             writer.writerow({column: row.get(column, "") for column in FRAME_PREDICTION_COLUMNS})
 
     return final_json_path, frame_csv_path
+
+
+def pair_sequence_dirs(
+    rca_study_dir: str | Path,
+    lca_study_dir: str | Path,
+    sequence_pair_policy: str = "trim_to_min",
+) -> tuple[list[tuple[int, Path, Path]], list[dict[str, Any]], dict[str, int]]:
+    """Pair RCA/LCA sequence directories deterministically."""
+    if sequence_pair_policy not in {"trim_to_min", "strict_equal"}:
+        raise ValueError("sequence_pair_policy must be 'trim_to_min' or 'strict_equal'.")
+
+    rca_sequences = discover_sequence_dirs(rca_study_dir)
+    lca_sequences = discover_sequence_dirs(lca_study_dir)
+    num_rca_sequences = len(rca_sequences)
+    num_lca_sequences = len(lca_sequences)
+
+    if sequence_pair_policy == "strict_equal" and num_rca_sequences != num_lca_sequences:
+        raise ValueError(
+            "strict_equal sequence pairing requires equal sequence counts: "
+            f"RCA={num_rca_sequences}, LCA={num_lca_sequences}."
+        )
+
+    num_pairs = min(num_rca_sequences, num_lca_sequences)
+    pairs = [
+        (pair_index, rca_sequences[pair_index], lca_sequences[pair_index])
+        for pair_index in range(num_pairs)
+    ]
+
+    report_rows: list[dict[str, Any]] = []
+    for pair_index, rca_dir, lca_dir in pairs:
+        report_rows.append(
+            {
+                "sequence_type": "RCA",
+                "sequence_index": pair_index,
+                "sequence_dir": str(rca_dir),
+                "paired": True,
+                "pair_index": pair_index,
+                "status": "paired",
+                "reason": "",
+            }
+        )
+        report_rows.append(
+            {
+                "sequence_type": "LCA",
+                "sequence_index": pair_index,
+                "sequence_dir": str(lca_dir),
+                "paired": True,
+                "pair_index": pair_index,
+                "status": "paired",
+                "reason": "",
+            }
+        )
+
+    for sequence_index, sequence_dir in enumerate(rca_sequences[num_pairs:], start=num_pairs):
+        report_rows.append(
+            {
+                "sequence_type": "RCA",
+                "sequence_index": sequence_index,
+                "sequence_dir": str(sequence_dir),
+                "paired": False,
+                "pair_index": "",
+                "status": "ignored_extra_sequence",
+                "reason": "No matching LCA sequence under trim_to_min policy.",
+            }
+        )
+    for sequence_index, sequence_dir in enumerate(lca_sequences[num_pairs:], start=num_pairs):
+        report_rows.append(
+            {
+                "sequence_type": "LCA",
+                "sequence_index": sequence_index,
+                "sequence_dir": str(sequence_dir),
+                "paired": False,
+                "pair_index": "",
+                "status": "ignored_extra_sequence",
+                "reason": "No matching RCA sequence under trim_to_min policy.",
+            }
+        )
+
+    summary = {
+        "num_rca_sequences": num_rca_sequences,
+        "num_lca_sequences": num_lca_sequences,
+        "num_sequence_pairs": num_pairs,
+        "num_ignored_rca_sequences": max(0, num_rca_sequences - num_pairs),
+        "num_ignored_lca_sequences": max(0, num_lca_sequences - num_pairs),
+    }
+    return pairs, report_rows, summary
+
+
+def _pair_row_from_result(
+    pair_index: int,
+    rca_sequence_dir: Path,
+    lca_sequence_dir: Path,
+    result: IntegratedInferenceResult,
+) -> dict[str, Any]:
+    final_prediction = result.final_prediction
+    metric_columns = PAIR_PREDICTION_COLUMNS[5:]
+    return {
+        "pair_index": pair_index,
+        "rca_sequence_dir": str(rca_sequence_dir),
+        "lca_sequence_dir": str(lca_sequence_dir),
+        "status": "valid",
+        "reason": "",
+        **{column: final_prediction.get(column, "") for column in metric_columns},
+    }
+
+
+def _skipped_pair_row(
+    pair_index: int,
+    rca_sequence_dir: Path,
+    lca_sequence_dir: Path,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "pair_index": pair_index,
+        "rca_sequence_dir": str(rca_sequence_dir),
+        "lca_sequence_dir": str(lca_sequence_dir),
+        "status": "skipped",
+        "reason": reason,
+    }
+
+
+def _mark_pairing_report_skipped(
+    report_rows: list[dict[str, Any]],
+    pair_index: int,
+    reason: str,
+) -> None:
+    for row in report_rows:
+        if row.get("pair_index") == pair_index:
+            row["status"] = "skipped"
+            row["reason"] = reason
+
+
+def aggregate_pair_predictions(pair_rows: list[dict[str, Any]]) -> tuple[int, float, dict[str, Any]]:
+    """Aggregate valid pair-level predictions into one study-level decision."""
+    valid_rows = [row for row in pair_rows if row.get("status") == "valid"]
+    if not valid_rows:
+        raise ValueError("No valid sequence pairs remain after pairing and validation.")
+
+    vote_rightdom = sum(int(row["pred_class"]) == 0 for row in valid_rows)
+    vote_leftdom = sum(int(row["pred_class"]) == 1 for row in valid_rows)
+    mean_prob_rightdom = sum(float(row["mean_prob_rightdom"]) for row in valid_rows) / len(valid_rows)
+    mean_prob_leftdom = sum(float(row["mean_prob_leftdom"]) for row in valid_rows) / len(valid_rows)
+
+    if vote_rightdom > vote_leftdom:
+        pred_class = 0
+    elif vote_leftdom > vote_rightdom:
+        pred_class = 1
+    elif mean_prob_leftdom > mean_prob_rightdom:
+        pred_class = 1
+    else:
+        pred_class = 0
+
+    final_confidence = mean_prob_rightdom if pred_class == 0 else mean_prob_leftdom
+    details = {
+        "vote_rightdom": int(vote_rightdom),
+        "vote_leftdom": int(vote_leftdom),
+        "mean_prob_rightdom": float(mean_prob_rightdom),
+        "mean_prob_leftdom": float(mean_prob_leftdom),
+    }
+    return pred_class, float(final_confidence), details
+
+
+def run_multi_sequence_study_integrated_inference(
+    rca_study_dir: str | Path,
+    lca_study_dir: str | Path,
+    rca_model: nn.Module,
+    lca_model: nn.Module,
+    device: torch.device,
+    sequence_pair_policy: str = "trim_to_min",
+    clip_length: int = 15,
+    image_size: int = 512,
+    mean: float = 0.5485,
+    std: float = 0.1407,
+    occlusion_threshold: float = 0.5,
+    frame_quality_threshold: float = 0.5,
+    batch_size: int = 16,
+) -> MultiSequenceInferenceResult:
+    """Run integrated inference across paired RCA/LCA sequences for one study."""
+    pairs, pairing_report_rows, pairing_summary = pair_sequence_dirs(
+        rca_study_dir=rca_study_dir,
+        lca_study_dir=lca_study_dir,
+        sequence_pair_policy=sequence_pair_policy,
+    )
+
+    pair_rows: list[dict[str, Any]] = []
+    pair_frame_rows: list[dict[str, Any]] = []
+    pair_predictions: list[dict[str, Any]] = []
+
+    for pair_index, rca_sequence_dir, lca_sequence_dir in pairs:
+        rca_has_frames = has_valid_image_files(rca_sequence_dir)
+        lca_has_frames = has_valid_image_files(lca_sequence_dir)
+        if not rca_has_frames or not lca_has_frames:
+            missing = []
+            if not rca_has_frames:
+                missing.append("RCA sequence has no valid image files")
+            if not lca_has_frames:
+                missing.append("LCA sequence has no valid image files")
+            reason = "; ".join(missing)
+            pair_rows.append(_skipped_pair_row(pair_index, rca_sequence_dir, lca_sequence_dir, reason))
+            _mark_pairing_report_skipped(pairing_report_rows, pair_index, reason)
+            continue
+
+        result = run_single_pair_integrated_inference(
+            rca_frame_dir=rca_sequence_dir,
+            lca_frame_dir=lca_sequence_dir,
+            rca_model=rca_model,
+            lca_model=lca_model,
+            device=device,
+            clip_length=clip_length,
+            image_size=image_size,
+            mean=mean,
+            std=std,
+            occlusion_threshold=occlusion_threshold,
+            frame_quality_threshold=frame_quality_threshold,
+            batch_size=batch_size,
+        )
+        pair_row = _pair_row_from_result(pair_index, rca_sequence_dir, lca_sequence_dir, result)
+        pair_rows.append(pair_row)
+        pair_predictions.append(
+            {
+                "pair_index": pair_index,
+                "rca_sequence_dir": str(rca_sequence_dir),
+                "lca_sequence_dir": str(lca_sequence_dir),
+                **result.final_prediction,
+            }
+        )
+        for frame_row in result.frame_rows:
+            pair_frame_rows.append({"pair_index": pair_index, **frame_row})
+
+    valid_pair_rows = [row for row in pair_rows if row.get("status") == "valid"]
+    pred_class, final_confidence, vote_details = aggregate_pair_predictions(pair_rows)
+    study_final_prediction = {
+        **pairing_summary,
+        "num_valid_pairs": len(valid_pair_rows),
+        "sequence_pair_policy": sequence_pair_policy,
+        **vote_details,
+        "pred_class": int(pred_class),
+        "pred_label": DOMINANCE_LABELS[pred_class],
+        "final_confidence": float(final_confidence),
+        "pair_predictions": pair_predictions,
+    }
+    return MultiSequenceInferenceResult(
+        study_final_prediction=study_final_prediction,
+        pair_rows=pair_rows,
+        pair_frame_rows=pair_frame_rows,
+        pairing_report_rows=pairing_report_rows,
+    )
+
+
+def write_multi_sequence_outputs(
+    result: MultiSequenceInferenceResult,
+    output_dir: str | Path,
+) -> tuple[Path, Path, Path, Path]:
+    """Write multi-sequence study outputs."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    final_json_path = output_path / "study_final_prediction.json"
+    with final_json_path.open("w", encoding="utf-8") as json_file:
+        json.dump(result.study_final_prediction, json_file, indent=2)
+
+    pair_csv_path = output_path / "pair_predictions.csv"
+    with pair_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=PAIR_PREDICTION_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for row in result.pair_rows:
+            writer.writerow({column: row.get(column, "") for column in PAIR_PREDICTION_COLUMNS})
+
+    pair_frame_csv_path = output_path / "pair_frame_predictions.csv"
+    with pair_frame_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=PAIR_FRAME_PREDICTION_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for row in result.pair_frame_rows:
+            writer.writerow({column: row.get(column, "") for column in PAIR_FRAME_PREDICTION_COLUMNS})
+
+    pairing_report_csv_path = output_path / "sequence_pairing_report.csv"
+    with pairing_report_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=SEQUENCE_PAIRING_REPORT_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for row in result.pairing_report_rows:
+            writer.writerow({column: row.get(column, "") for column in SEQUENCE_PAIRING_REPORT_COLUMNS})
+
+    return final_json_path, pair_csv_path, pair_frame_csv_path, pairing_report_csv_path
