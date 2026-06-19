@@ -1,0 +1,6 @@
+# Core dependencies for training, evaluation, and integrated inference
+# Tested with Python 3.9.8, PyTorch 2.6.0, CUDA 12.4
+
+torch==2.6.0
+torchvision
+Pillow

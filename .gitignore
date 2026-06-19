@@ -5,6 +5,12 @@ Dir_structure.md
 Dir_structure - old.md
 enrich_split_csvs.py
 splits_old/
+mini_dataset/
+splits_mini/
+references/
+notebooks_raw/
+configs/
+AGENTS.md
 
 # Python
 __pycache__/
