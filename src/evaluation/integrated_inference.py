@@ -12,7 +12,9 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from src.data.label_maps import get_class_id
 from src.data.mtl_dataset import build_mtl_transform, evenly_spaced_indices, load_grayscale_image
+from src.evaluation.metrics import binary_classification_metrics
 from src.models import CoronaryTemporalMTL
 from src.models.backbones import normalize_backbone_name
 from src.training.checkpointing import load_checkpoint
@@ -65,6 +67,62 @@ SEQUENCE_PAIRING_REPORT_COLUMNS = (
     "status",
     "reason",
 )
+INTEGRATED_PREDICTION_COLUMNS = (
+    "study_id",
+    "label",
+    "true_class",
+    "pred_class",
+    "pred_label",
+    "correct",
+    "subset",
+    "status",
+    "reason",
+    "num_rca_sequences",
+    "num_lca_sequences",
+    "num_sequence_pairs",
+    "num_valid_pairs",
+    "sequence_pair_policy",
+    "num_ignored_rca_sequences",
+    "num_ignored_lca_sequences",
+    "vote_rightdom",
+    "vote_leftdom",
+    "mean_prob_rightdom",
+    "mean_prob_leftdom",
+    "final_confidence",
+)
+ALL_PAIR_PREDICTION_COLUMNS = (
+    "study_id",
+    "subset",
+    "pair_index",
+    "rca_sequence_dir",
+    "lca_sequence_dir",
+    "status",
+    "reason",
+    "route_used",
+    "rca_occluded",
+    "occlusion_probability",
+    "pred_class",
+    "pred_label",
+    "final_confidence",
+)
+ALL_PAIR_FRAME_PREDICTION_COLUMNS = ("study_id", "subset", *PAIR_FRAME_PREDICTION_COLUMNS)
+ALL_SEQUENCE_PAIRING_REPORT_COLUMNS = ("study_id", "subset", *SEQUENCE_PAIRING_REPORT_COLUMNS)
+METRIC_COLUMNS = (
+    "accuracy",
+    "precision",
+    "recall",
+    "sensitivity",
+    "specificity",
+    "f1",
+    "mcc",
+    "tn",
+    "fp",
+    "fn",
+    "tp",
+    "sample_count",
+    "confusion_matrix",
+)
+MANIFEST_REQUIRED_COLUMNS = ("study_id", "label", "rca_study_dir", "lca_study_dir")
 
 DOMINANCE_LABELS = {0: "rightdom", 1: "leftdom"}
 FRAME_QUALITY_LABELS = {0: "noninformative", 1: "informative"}
@@ -119,6 +177,19 @@ class MultiSequenceInferenceResult:
     pair_rows: list[dict[str, Any]]
     pair_frame_rows: list[dict[str, Any]]
     pairing_report_rows: list[dict[str, Any]]
+
+
+@dataclass
+class ManifestCohortInferenceResult:
+    """Cohort-level integrated inference result and combined output rows."""
+
+    prediction_rows: list[dict[str, Any]]
+    metrics: dict[str, Any]
+    subset_metrics: dict[str, dict[str, Any]]
+    all_pair_rows: list[dict[str, Any]]
+    all_pair_frame_rows: list[dict[str, Any]]
+    all_pairing_report_rows: list[dict[str, Any]]
+    has_subset: bool
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -729,3 +800,264 @@ def write_multi_sequence_outputs(
             writer.writerow({column: row.get(column, "") for column in SEQUENCE_PAIRING_REPORT_COLUMNS})
 
     return final_json_path, pair_csv_path, pair_frame_csv_path, pairing_report_csv_path
+
+
+def _csv_value(value: Any) -> Any:
+    """Convert nested values to portable CSV cells."""
+    if isinstance(value, (list, dict)):
+        return json.dumps(value)
+    return value
+
+
+def _read_manifest_rows(manifest_csv: str | Path) -> tuple[list[dict[str, str]], bool]:
+    manifest_path = Path(manifest_csv)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Manifest CSV not found: {manifest_path}")
+
+    with manifest_path.open("r", newline="", encoding="utf-8-sig") as csv_file:
+        reader = csv.DictReader(csv_file)
+        fieldnames = tuple(reader.fieldnames or ())
+        missing_columns = [column for column in MANIFEST_REQUIRED_COLUMNS if column not in fieldnames]
+        if missing_columns:
+            missing_text = ", ".join(missing_columns)
+            raise ValueError(f"Manifest CSV is missing required columns: {missing_text}")
+        has_subset = "subset" in fieldnames
+        return [dict(row) for row in reader], has_subset
+
+
+def _manifest_prediction_row(
+    manifest_row: dict[str, str],
+    true_class: int | str,
+    status: str,
+    reason: str,
+    has_subset: bool,
+    sequence_pair_policy: str,
+    final_prediction: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    final_prediction = final_prediction or {}
+    pred_class = final_prediction.get("pred_class", "")
+    correct = ""
+    if status == "valid" and pred_class != "" and true_class != "":
+        correct = int(pred_class) == int(true_class)
+
+    return {
+        "study_id": (manifest_row.get("study_id") or "").strip(),
+        "label": (manifest_row.get("label") or "").strip(),
+        "true_class": true_class,
+        "pred_class": pred_class,
+        "pred_label": final_prediction.get("pred_label", ""),
+        "correct": correct,
+        "subset": (manifest_row.get("subset") or "").strip() if has_subset else "",
+        "status": status,
+        "reason": reason,
+        "num_rca_sequences": final_prediction.get("num_rca_sequences", ""),
+        "num_lca_sequences": final_prediction.get("num_lca_sequences", ""),
+        "num_sequence_pairs": final_prediction.get("num_sequence_pairs", ""),
+        "num_valid_pairs": final_prediction.get("num_valid_pairs", ""),
+        "sequence_pair_policy": final_prediction.get("sequence_pair_policy", sequence_pair_policy),
+        "num_ignored_rca_sequences": final_prediction.get("num_ignored_rca_sequences", ""),
+        "num_ignored_lca_sequences": final_prediction.get("num_ignored_lca_sequences", ""),
+        "vote_rightdom": final_prediction.get("vote_rightdom", ""),
+        "vote_leftdom": final_prediction.get("vote_leftdom", ""),
+        "mean_prob_rightdom": final_prediction.get("mean_prob_rightdom", ""),
+        "mean_prob_leftdom": final_prediction.get("mean_prob_leftdom", ""),
+        "final_confidence": final_prediction.get("final_confidence", ""),
+    }
+
+
+def _prefixed_rows(
+    rows: list[dict[str, Any]],
+    study_id: str,
+    subset: str,
+) -> list[dict[str, Any]]:
+    return [{"study_id": study_id, "subset": subset, **row} for row in rows]
+
+
+def _compute_subset_metrics(
+    prediction_rows: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    subset_metrics: dict[str, dict[str, Any]] = {}
+    subsets = sorted({str(row.get("subset", "")) for row in prediction_rows if row.get("status") == "valid"})
+    for subset in subsets:
+        subset_rows = [
+            row
+            for row in prediction_rows
+            if row.get("status") == "valid" and str(row.get("subset", "")) == subset
+        ]
+        targets = [int(row["true_class"]) for row in subset_rows]
+        predictions = [int(row["pred_class"]) for row in subset_rows]
+        subset_metrics[subset] = binary_classification_metrics(targets, predictions)
+    return subset_metrics
+
+
+def run_manifest_cohort_integrated_inference(
+    manifest_csv: str | Path,
+    rca_model: nn.Module,
+    lca_model: nn.Module,
+    device: torch.device,
+    invalid_study_policy: str = "skip",
+    sequence_pair_policy: str = "trim_to_min",
+    clip_length: int = 15,
+    image_size: int = 512,
+    mean: float = 0.5485,
+    std: float = 0.1407,
+    occlusion_threshold: float = 0.5,
+    frame_quality_threshold: float = 0.5,
+    batch_size: int = 16,
+) -> ManifestCohortInferenceResult:
+    """Run integrated inference for every study in a manifest CSV."""
+    if invalid_study_policy not in {"skip", "error"}:
+        raise ValueError("invalid_study_policy must be 'skip' or 'error'.")
+
+    manifest_rows, has_subset = _read_manifest_rows(manifest_csv)
+    prediction_rows: list[dict[str, Any]] = []
+    all_pair_rows: list[dict[str, Any]] = []
+    all_pair_frame_rows: list[dict[str, Any]] = []
+    all_pairing_report_rows: list[dict[str, Any]] = []
+    targets: list[int] = []
+    predictions: list[int] = []
+
+    for row_number, manifest_row in enumerate(manifest_rows, start=2):
+        study_id = (manifest_row.get("study_id") or "").strip()
+        subset = (manifest_row.get("subset") or "").strip() if has_subset else ""
+        true_class: int | str = ""
+        try:
+            label = (manifest_row.get("label") or "").strip()
+            true_class = get_class_id("dominance", label)
+
+            rca_study_dir = (manifest_row.get("rca_study_dir") or "").strip()
+            lca_study_dir = (manifest_row.get("lca_study_dir") or "").strip()
+            if not rca_study_dir:
+                raise ValueError("missing rca_study_dir")
+            if not lca_study_dir:
+                raise ValueError("missing lca_study_dir")
+
+            study_result = run_multi_sequence_study_integrated_inference(
+                rca_study_dir=rca_study_dir,
+                lca_study_dir=lca_study_dir,
+                rca_model=rca_model,
+                lca_model=lca_model,
+                device=device,
+                sequence_pair_policy=sequence_pair_policy,
+                clip_length=clip_length,
+                image_size=image_size,
+                mean=mean,
+                std=std,
+                occlusion_threshold=occlusion_threshold,
+                frame_quality_threshold=frame_quality_threshold,
+                batch_size=batch_size,
+            )
+            final_prediction = study_result.study_final_prediction
+            pred_class = int(final_prediction["pred_class"])
+
+            prediction_rows.append(
+                _manifest_prediction_row(
+                    manifest_row=manifest_row,
+                    true_class=true_class,
+                    status="valid",
+                    reason="",
+                    has_subset=has_subset,
+                    sequence_pair_policy=sequence_pair_policy,
+                    final_prediction=final_prediction,
+                )
+            )
+            targets.append(int(true_class))
+            predictions.append(pred_class)
+            all_pair_rows.extend(_prefixed_rows(study_result.pair_rows, study_id, subset))
+            all_pair_frame_rows.extend(_prefixed_rows(study_result.pair_frame_rows, study_id, subset))
+            all_pairing_report_rows.extend(_prefixed_rows(study_result.pairing_report_rows, study_id, subset))
+        except Exception as exc:
+            reason = f"row {row_number}: {exc}"
+            if invalid_study_policy == "error":
+                raise RuntimeError(f"Invalid study '{study_id or '<missing study_id>'}' in manifest: {reason}") from exc
+            prediction_rows.append(
+                _manifest_prediction_row(
+                    manifest_row=manifest_row,
+                    true_class=true_class,
+                    status="invalid",
+                    reason=reason,
+                    has_subset=has_subset,
+                    sequence_pair_policy=sequence_pair_policy,
+                )
+            )
+
+    metrics = binary_classification_metrics(targets, predictions)
+    subset_metrics = _compute_subset_metrics(prediction_rows) if has_subset else {}
+    return ManifestCohortInferenceResult(
+        prediction_rows=prediction_rows,
+        metrics=metrics,
+        subset_metrics=subset_metrics,
+        all_pair_rows=all_pair_rows,
+        all_pair_frame_rows=all_pair_frame_rows,
+        all_pairing_report_rows=all_pairing_report_rows,
+        has_subset=has_subset,
+    )
+
+
+def write_manifest_outputs(
+    result: ManifestCohortInferenceResult,
+    output_dir: str | Path,
+) -> dict[str, Path]:
+    """Write cohort-level integrated inference outputs."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    paths = {
+        "predictions": output_path / "integrated_predictions.csv",
+        "metrics_csv": output_path / "integrated_metrics.csv",
+        "metrics_json": output_path / "integrated_metrics.json",
+        "pair_predictions": output_path / "all_pair_predictions.csv",
+        "pair_frame_predictions": output_path / "all_pair_frame_predictions.csv",
+        "pairing_report": output_path / "all_sequence_pairing_report.csv",
+    }
+
+    with paths["predictions"].open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=INTEGRATED_PREDICTION_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for row in result.prediction_rows:
+            writer.writerow({column: _csv_value(row.get(column, "")) for column in INTEGRATED_PREDICTION_COLUMNS})
+
+    with paths["metrics_csv"].open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=METRIC_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerow({column: _csv_value(result.metrics.get(column, "")) for column in METRIC_COLUMNS})
+
+    metrics_json = {"overall": result.metrics}
+    if result.has_subset:
+        metrics_json["subsets"] = result.subset_metrics
+    with paths["metrics_json"].open("w", encoding="utf-8") as json_file:
+        json.dump(metrics_json, json_file, indent=2)
+
+    if result.has_subset:
+        subset_path = output_path / "subset_metrics.csv"
+        paths["subset_metrics"] = subset_path
+        with subset_path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=("subset", *METRIC_COLUMNS), extrasaction="ignore")
+            writer.writeheader()
+            for subset, metrics in result.subset_metrics.items():
+                writer.writerow(
+                    {
+                        "subset": subset,
+                        **{column: _csv_value(metrics.get(column, "")) for column in METRIC_COLUMNS},
+                    }
+                )
+
+    with paths["pair_predictions"].open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=ALL_PAIR_PREDICTION_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for row in result.all_pair_rows:
+            writer.writerow({column: _csv_value(row.get(column, "")) for column in ALL_PAIR_PREDICTION_COLUMNS})
+
+    with paths["pair_frame_predictions"].open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=ALL_PAIR_FRAME_PREDICTION_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for row in result.all_pair_frame_rows:
+            writer.writerow({column: _csv_value(row.get(column, "")) for column in ALL_PAIR_FRAME_PREDICTION_COLUMNS})
+
+    with paths["pairing_report"].open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=ALL_SEQUENCE_PAIRING_REPORT_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for row in result.all_pairing_report_rows:
+            writer.writerow({column: _csv_value(row.get(column, "")) for column in ALL_SEQUENCE_PAIRING_REPORT_COLUMNS})
+
+    return paths

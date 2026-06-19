@@ -13,21 +13,25 @@ if str(REPO_ROOT) not in sys.path:
 from src.evaluation.integrated_inference import (
     load_model_from_checkpoint,
     resolve_device,
+    run_manifest_cohort_integrated_inference,
     run_multi_sequence_study_integrated_inference,
     run_single_pair_integrated_inference,
     write_integrated_outputs,
+    write_manifest_outputs,
     write_multi_sequence_outputs,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run integrated RCA/LCA inference.")
-    parser.add_argument("--input_mode", default="single_pair", choices=["single_pair", "multi_sequence_study"])
+    parser.add_argument("--input_mode", default="single_pair", choices=["single_pair", "multi_sequence_study", "manifest"])
     parser.add_argument("--rca_frame_dir", type=Path)
     parser.add_argument("--lca_frame_dir", type=Path)
     parser.add_argument("--rca_study_dir", type=Path)
     parser.add_argument("--lca_study_dir", type=Path)
+    parser.add_argument("--manifest_csv", type=Path)
     parser.add_argument("--sequence_pair_policy", default="trim_to_min", choices=["trim_to_min", "strict_equal"])
+    parser.add_argument("--invalid_study_policy", default="skip", choices=["skip", "error"])
     parser.add_argument("--rca_checkpoint", required=True, type=Path)
     parser.add_argument("--lca_checkpoint", required=True, type=Path)
     parser.add_argument("--backbone", default="resnet18", choices=["resnet18", "mobilenet_v2", "densenet121"])
@@ -63,6 +67,9 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
         if missing:
             missing_text = ", ".join(f"--{name}" for name in missing)
             raise ValueError(f"--input_mode multi_sequence_study requires: {missing_text}")
+    elif args.input_mode == "manifest":
+        if args.manifest_csv is None:
+            raise ValueError("--input_mode manifest requires: --manifest_csv")
     return args
 
 
@@ -113,7 +120,7 @@ def main() -> int:
         print(f"Final prediction: {final_prediction['pred_label']} ({final_prediction['final_confidence']:.4f})")
         print(f"Final JSON: {final_json_path}")
         print(f"Frame CSV: {frame_csv_path}")
-    else:
+    elif args.input_mode == "multi_sequence_study":
         result = run_multi_sequence_study_integrated_inference(
             rca_study_dir=args.rca_study_dir,
             lca_study_dir=args.lca_study_dir,
@@ -142,6 +149,39 @@ def main() -> int:
         print(f"Pair CSV: {pair_csv_path}")
         print(f"Pair frame CSV: {pair_frame_csv_path}")
         print(f"Pairing report CSV: {pairing_report_csv_path}")
+    else:
+        result = run_manifest_cohort_integrated_inference(
+            manifest_csv=args.manifest_csv,
+            rca_model=rca_model,
+            lca_model=lca_model,
+            device=device,
+            invalid_study_policy=args.invalid_study_policy,
+            sequence_pair_policy=args.sequence_pair_policy,
+            clip_length=args.clip_length,
+            image_size=args.image_size,
+            mean=args.mean,
+            std=args.std,
+            occlusion_threshold=args.occlusion_threshold,
+            frame_quality_threshold=args.frame_quality_threshold,
+            batch_size=args.batch_size,
+        )
+        output_paths = write_manifest_outputs(result, args.output_dir)
+        valid_count = int(result.metrics["sample_count"])
+        invalid_count = sum(row.get("status") != "valid" for row in result.prediction_rows)
+
+        print("Manifest integrated inference complete.")
+        print(f"Studies in manifest: {len(result.prediction_rows)}")
+        print(f"Valid studies: {valid_count}")
+        print(f"Invalid studies: {invalid_count}")
+        print(f"Accuracy: {result.metrics['accuracy']:.4f}")
+        print(f"Predictions CSV: {output_paths['predictions']}")
+        print(f"Metrics CSV: {output_paths['metrics_csv']}")
+        print(f"Metrics JSON: {output_paths['metrics_json']}")
+        if "subset_metrics" in output_paths:
+            print(f"Subset metrics CSV: {output_paths['subset_metrics']}")
+        print(f"All pair CSV: {output_paths['pair_predictions']}")
+        print(f"All pair frame CSV: {output_paths['pair_frame_predictions']}")
+        print(f"All pairing report CSV: {output_paths['pairing_report']}")
     return 0
 
 
