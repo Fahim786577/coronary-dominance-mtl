@@ -192,7 +192,7 @@ filename,label,study_id,artery,split,task,fold
 
 The `filename` column should point to the corresponding frame path. Depending on the user’s local machine, this may need to be updated to match the local dataset location.
 
-More dataset and preprocessing details are provided in `DATASET.md`.
+More dataset and preprocessing details are provided in [`DATASET.md`](DATASET.md).
 
 ---
 
