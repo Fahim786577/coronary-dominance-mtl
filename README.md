@@ -1050,8 +1050,7 @@ outputs/teachers/<task>/DATA_<artery>/fold_<fold>/<backbone>/best.pt
 outputs/mtl/<mode>/DATA_<artery>/fold_<fold>/<backbone>/best.pt
 ```
 
-To reproduce reported values, place the released checkpoints in the expected directory structure and run the corresponding evaluation or integrated inference command.
-
+Checkpoint release is currently under verification to ensure compatibility with the reorganized codebase and will be documented separately if provided.
 ---
 
 ## License and Citation
