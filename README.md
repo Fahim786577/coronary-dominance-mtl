@@ -1051,7 +1051,7 @@ outputs/mtl/<mode>/DATA_<artery>/fold_<fold>/<backbone>/best.pt
 
 Checkpoint release is currently under verification to ensure compatibility with the reorganized codebase. If verified checkpoints are released later, their download links and usage instructions will be documented here.
 
-Legacy converted checkpoints from earlier model definitions are documented separately in the [coronary-dominance-mtl-old-model-option](https://github.com/Fahim786577/coronary-dominance-mtl) compatibility repository. 
+Legacy converted checkpoints from earlier model definitions are documented separately in the [coronary-dominance-mtl-old-model-option](https://github.com/Fahim786577/coronary-dominance-mtl-old-model-option) compatibility repository. 
 
 ---
 
